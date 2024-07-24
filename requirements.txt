@@ -1,0 +1,4 @@
+transformers==4.43.2
+torch==2.4.0
+webvtt-py==0.5.1
+intel-extension-for-pytorch
