@@ -1,5 +1,3 @@
-# train_llm.py
-
 import os
 import json
 import torch
@@ -24,7 +22,7 @@ def load_texts_from_file(file_path):
         return json.load(f)
 
 # File paths to the extracted texts
-text_file_paths = ["D:/jworg/vtts.json", "D:/jworg/jwpubs.json"]
+text_file_paths = ["E:/jworg/vtts.json", "E:/jworg/jwpubs.json"]
 
 # Load the texts from the files
 all_texts = []
@@ -33,12 +31,17 @@ for file_path in text_file_paths:
     if os.path.exists(file_path):
         print(f"Loading extracted texts from {file_path}...")
         texts = load_texts_from_file(file_path)
-        all_texts.extend(texts)
+        # Extract only the 'text' field
+        texts_only = [item['text'] for item in texts]
+        all_texts.extend(texts_only)
     else:
         print(f"Extracted texts file {file_path} not found. Please check the file path.")
         exit()
 
 print(f"Loaded {len(all_texts)} texts for training.")
+
+# Create a Dataset object from the list of texts
+dataset = Dataset.from_dict({'text': all_texts})
 
 # Step 2: Preprocess Data
 print("Loading tokenizer...")
@@ -49,9 +52,6 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-# Create a Dataset object from the list of texts
-dataset = Dataset.from_dict({'text': all_texts})
-
 # Define the tokenize function
 def tokenize_function(examples):
     return tokenizer(examples['text'], truncation=True, padding='max_length', max_length=2048)
@@ -61,7 +61,7 @@ print("Tokenizing dataset...")
 tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=['text'])
 
 # Set the block size to the model's maximum input length for efficient training
-block_size = 2048  # Adjust this value based on your model's max input length
+block_size = 1024  # Adjust this value based on your model's max input length
 
 # Group texts into blocks of block_size
 def group_texts(examples):
@@ -99,6 +99,9 @@ except Exception as e:
 # Move model to GPU if available
 model.to(device)
 
+# Disable caching for gradient checkpointing
+model.config.use_cache = False  # Important for gradient checkpointing
+
 # Define the data collator for language modeling
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
@@ -108,6 +111,7 @@ training_args = TrainingArguments(
     overwrite_output_dir=True,
     num_train_epochs=1,  # Adjust this as needed
     per_device_train_batch_size=1,  # Adjust based on your GPU capacity
+    per_device_eval_batch_size=1,  # Set evaluation batch size to 1
     evaluation_strategy="steps",
     eval_steps=500,
     save_steps=500,

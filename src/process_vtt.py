@@ -4,7 +4,7 @@ import os
 import json
 import webvtt
 
-# Step 1: Extract Text from .vtt Files
+# Function to extract text from .vtt files
 def extract_text_from_vtt(file_path):
     text = ''
     for caption in webvtt.read(file_path):
@@ -13,26 +13,60 @@ def extract_text_from_vtt(file_path):
             text += caption.text + ' '
     return text.replace('\n', ' ')
 
-def load_vtt_files(directory):
-    vtt_files = [os.path.join(directory, file) for file in os.listdir(directory) if file.endswith('.vtt')]
-    all_texts = [extract_text_from_vtt(file) for file in vtt_files]
-    return all_texts
+# Function to load the metadata from S.json
+def load_metadata(sjson_path):
+    metadata_map = {}
+    with open(sjson_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            data = json.loads(line)
+            if data.get('type') == 'media-item':
+                o = data.get('o', {})
+                naturalKey = o.get('naturalKey')
+                title = o.get('title')
+                primaryCategory = o.get('primaryCategory')
+                if naturalKey:
+                    metadata_map[naturalKey] = {
+                        'title': title,
+                        'primaryCategory': primaryCategory,
+                    }
+    return metadata_map
 
-# Function to save the extracted texts to a file
-def save_texts_to_file(texts, file_path):
+# Function to load and process .vtt files
+def load_vtt_files(directory, metadata_map):
+    vtt_files = [os.path.join(directory, file) for file in os.listdir(directory) if file.endswith('.vtt')]
+    all_data = []
+    for vtt_file in vtt_files:
+        text = extract_text_from_vtt(vtt_file)
+        filename = os.path.basename(vtt_file)
+        # Get naturalKey from filename (without extension)
+        naturalKey = os.path.splitext(filename)[0]
+        # Get metadata
+        metadata = metadata_map.get(naturalKey, {})
+        data_entry = {
+            'text': text,
+            'naturalKey': naturalKey,
+            'title': metadata.get('title', ''),
+            'primaryCategory': metadata.get('primaryCategory', ''),
+        }
+        all_data.append(data_entry)
+    return all_data
+
+# Function to save the extracted data to a file
+def save_data_to_file(data, file_path):
     with open(file_path, 'w', encoding='utf-8') as f:
-        json.dump(texts, f, ensure_ascii=False, indent=4)
+        json.dump(data, f, ensure_ascii=False, indent=4)
 
 # Directory and file paths
-directory = "D:/jworg"  # Update this path to your .vtt files directory
-text_file_path = "D:/jworg/vtts.json"
+directory = "E:/jworg"  # Update this path to your .vtt files directory
+text_file_path = os.path.join(directory, "vtts.json")
+sjson_path = os.path.join(directory, "S.json")
 
-# Check if the text file already exists. If it does, skip extraction.
-if os.path.exists(text_file_path):
-    print(f"{text_file_path} already exists. Skipping extraction.")
-else:
-    print("Extracting texts from .vtt files...")
-    all_texts = load_vtt_files(directory)
-    save_texts_to_file(all_texts, text_file_path)
-    print(f"Processed text from {len(all_texts)} .vtt files")
-    print(f"Extracted texts saved to {text_file_path}")
+print("Loading metadata from S.json...")
+metadata_map = load_metadata(sjson_path)
+print(f"Loaded metadata for {len(metadata_map)} media items.")
+
+print("Extracting texts from .vtt files...")
+all_data = load_vtt_files(directory, metadata_map)
+save_data_to_file(all_data, text_file_path)
+print(f"Processed text from {len(all_data)} .vtt files")
+print(f"Extracted data saved to {text_file_path}")

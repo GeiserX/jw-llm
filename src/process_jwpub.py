@@ -1,68 +1,55 @@
-# process_jwpubs.py
-
 import os
 import zipfile
-import json
 import sqlite3
 import tempfile
 import shutil
 import hashlib
 import zlib
 from Crypto.Cipher import AES
-from bs4 import BeautifulSoup
-import re
-import nltk
-from nltk.tokenize import sent_tokenize
-import hashlib
-
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
+from Crypto.Util.Padding import unpad
+import json
+import traceback
+from bs4 import BeautifulSoup  # Import BeautifulSoup for HTML parsing
 
 def process_jwpub(file_path):
     texts = []
-    
-    # Create a temporary directory to extract files
+
+    print(f"Starting processing of: {file_path}")
+
     tmpdirname = tempfile.mkdtemp()
     try:
-        # Unzip the .jwpub file
+        # Step 1: Extract contents of the jwpub file
         with zipfile.ZipFile(file_path, 'r') as zip_ref:
             zip_ref.extractall(tmpdirname)
-        
-        # Locate the 'contents' file
+
         contents_path = os.path.join(tmpdirname, 'contents')
-        
         if not os.path.exists(contents_path):
-            print(f"'contents' file not found in {file_path}")
+            print("No 'contents' file found.")
             return texts
-        
-        # Unzip the 'contents' file to get the SQLite database
+
         contents_tmpdirname = tempfile.mkdtemp()
         try:
             try:
                 with zipfile.ZipFile(contents_path, 'r') as zip_ref:
                     zip_ref.extractall(contents_tmpdirname)
             except zipfile.BadZipFile:
-                print(f"Error: {contents_path} is not a valid zip file.")
+                print("Bad ZIP file in contents.")
                 return texts
-            
-            # Find the SQLite database file
+
+            # Find the .db file in the extracted contents
             db_files = [os.path.join(contents_tmpdirname, file) for file in os.listdir(contents_tmpdirname) if file.endswith('.db')]
 
             if not db_files:
-                print(f"No SQLite database file found in {contents_path}")
+                print("No database files found.")
                 return texts
 
-            db_file_path = db_files[0]  # Assuming there's only one database file
+            db_file_path = db_files[0]
 
-            # Begin processing the database
             conn = sqlite3.connect(db_file_path)
             cursor = conn.cursor()
 
-            # Step 1: Calculate the publication card hash
             try:
-                # Query the required fields from the Publication table
+                # Query the Publication table to get necessary fields
                 cursor.execute("""
                     SELECT MepsLanguageIndex, Symbol, Year, IssueTagNumber
                     FROM Publication
@@ -70,254 +57,186 @@ def process_jwpub(file_path):
                 """)
                 row = cursor.fetchone()
                 if not row:
-                    print("No data found in Publication table.")
+                    print("No data in Publication table.")
                     conn.close()
                     return texts
 
                 meps_language_index, symbol, year, issue_tag_number = row
 
-                # Create the list of fields
-                fields = [str(meps_language_index), symbol, str(year)]
-                if issue_tag_number != '0' and issue_tag_number != '':
-                    fields.append(issue_tag_number)
+                print(f"MepsLanguageIndex: {meps_language_index}")
+                print(f"Symbol: '{symbol}'")
+                print(f"Year: {year}")
+                print(f"IssueTagNumber: {issue_tag_number}")
+
+                # Build the hash input string
+                fields = []
+                try:
+                    fields.append(str(meps_language_index).strip())
+                except Exception as e:
+                    print(f"Error getting MepsLanguageIndex: {e}")
+                    return texts
+                try:
+                    fields.append(symbol.strip())
+                except Exception as e:
+                    print(f"Error getting Symbol: {e}")
+                    return texts
+                try:
+                    fields.append(str(year).strip())
+                except Exception as e:
+                    print(f"Error getting Year: {e}")
+                    return texts
+
+                issue_tag_number_str = str(issue_tag_number).strip()
+                if issue_tag_number_str and issue_tag_number_str != '0':
+                    fields.append(issue_tag_number_str)
 
                 # Join the list with underscores
                 joined_string = '_'.join(fields)
+                print(f"Hash input string: '{joined_string}'")
 
                 # Calculate SHA-256 hash of the string
                 sha256_hash = hashlib.sha256(joined_string.encode('utf-8')).digest()
+                print(f"SHA-256 hash: {sha256_hash.hex()}")
 
-                # Known value to XOR with
+                # Known value to XOR with (ensure it's bytes)
                 known_value_hex = '11cbb5587e32846d4c26790c633da289f66fe5842a3a585ce1bc3a294af5ada7'
                 known_value = bytes.fromhex(known_value_hex)
+                print(f"Known value for XOR: {known_value.hex()}")
 
                 # XOR the hash with the known value
                 final_hash = bytes(a ^ b for a, b in zip(sha256_hash, known_value))
+                print(f"Final hash after XOR: {final_hash.hex()}")
 
                 # Extract AES key and IV from the final hash
                 aes_key = final_hash[:16]  # First 16 bytes
                 aes_iv = final_hash[16:]   # Last 16 bytes
+                print(f"AES Key: {aes_key.hex()}, Length: {len(aes_key)}")
+                print(f"AES IV: {aes_iv.hex()}, Length: {len(aes_iv)}")
 
                 # Step 2: Decrypt and decompress the content
-                # Fetch the encrypted content from the Document table
-                cursor.execute("""
-                    SELECT Content
-                    FROM Document
-                    LIMIT 1;
-                """)
-                row = cursor.fetchone()
-                if not row:
-                    print("No content found in Document table.")
+                # Fetch all content entries from the Document table
+                content_entries = []
+                for table_name in ['Document', 'BibleChapter', 'BibleVerse']:
+                    try:
+                        cursor.execute(f"""
+                            SELECT DocumentId, Content
+                            FROM {table_name};
+                        """)
+                        rows = cursor.fetchall()
+                        if rows:
+                            content_entries.extend(rows)
+                            print(f"Found encrypted content in table '{table_name}', number of entries: {len(rows)}")
+                    except sqlite3.Error as e:
+                        print(f"Error accessing table '{table_name}': {e}")
+                        continue
+
+                if not content_entries:
+                    print("No encrypted content found in any known table.")
                     conn.close()
                     return texts
 
-                encrypted_content = row[0]  # This is the BLOB field
+                # Process entries and collect extracted text
+                for idx, (document_id, encrypted_content) in enumerate(content_entries):
+                    print(f"Processing encrypted content entry {idx + 1}/{len(content_entries)}")
+                    print(f"Encrypted content length: {len(encrypted_content)} bytes")
 
-                # Initialize the AES cipher
-                cipher = AES.new(aes_key, AES.MODE_CBC, aes_iv)
+                    try:
+                        cipher = AES.new(aes_key, AES.MODE_CBC, aes_iv)
+                        decrypted_data = cipher.decrypt(encrypted_content)
+                        print(f"Decrypted data length: {len(decrypted_data)} bytes")
+                    except Exception as e:
+                        print(f"Error decrypting data: {e}")
+                        continue
 
-                # Decrypt the content
-                decrypted_data = cipher.decrypt(encrypted_content)
+                    try:
+                        decrypted_data = unpad(decrypted_data, AES.block_size)
+                        print(f"Data after unpadding length: {len(decrypted_data)} bytes")
+                    except ValueError as e:
+                        print(f"Error unpadding data: {e}")
+                        continue
 
-                # Remove PKCS7 padding
-                padding_length = decrypted_data[-1]
-                if isinstance(padding_length, str):
-                    padding_length = ord(padding_length)
-                decrypted_data = decrypted_data[:-padding_length]
+                    try:
+                        decompressed_data = zlib.decompress(decrypted_data)
+                        print(f"Data after decompression length: {len(decompressed_data)} bytes")
+                    except Exception as e:
+                        print(f"Error decompressing data: {e}")
+                        continue
 
-                # Decompress using zlib
-                decompressed_data = zlib.decompress(decrypted_data)
+                    # Decode the decompressed data as UTF-8 text
+                    try:
+                        html_content = decompressed_data.decode('utf-8', errors='replace')
+                    except UnicodeDecodeError as e:
+                        print(f"Error decoding decompressed data: {e}")
+                        html_content = ''
 
-                # Decode to string
-                text_content = decompressed_data.decode('utf-8')
+                    # Parse the HTML content to extract text
+                    try:
+                        soup = BeautifulSoup(html_content, 'html.parser')
 
-                # Use DocumentParagraph to segment the content
-                cursor.execute("""
-                    SELECT BeginPosition, EndPosition 
-                    FROM DocumentParagraph 
-                    ORDER BY ParagraphIndex;
-                """)
-                paragraphs = cursor.fetchall()
+                        # Extract paragraphs
+                        paragraphs = soup.find_all('p')
+                        paragraph_text = '\n\n'.join([para.get_text(strip=True) for para in paragraphs])
 
-                # Extract each paragraph using the positions
-                extracted_paragraphs = []
-                for begin_pos, end_pos in paragraphs:
-                    paragraph_text = text_content[begin_pos:end_pos]
-                    extracted_paragraphs.append(paragraph_text.strip())
+                        # If no paragraphs found, extract all text
+                        if not paragraphs:
+                            paragraph_text = soup.get_text(separator='\n', strip=True)
 
-                # Combine paragraphs into full text
-                full_text = '\n\n'.join(extracted_paragraphs)
+                        # Prepare the data entry
+                        data_entry = {
+                            'filename': os.path.basename(file_path),
+                            'document_id': document_id,
+                            'text': paragraph_text
+                        }
 
-                # Process the text
-                cleaned_text = process_text(full_text)
+                        texts.append(data_entry)
 
-                texts.append(cleaned_text)
+                    except Exception as e:
+                        print(f"Error parsing HTML content: {e}")
+                        continue
 
             except Exception as e:
-                print(f"An error occurred while processing {file_path}: {e}")
+                print(f"An unexpected error occurred: {e}")
+                traceback.print_exc()
                 return texts
 
             finally:
-                # Close the connection
                 cursor.close()
                 conn.close()
 
         finally:
-            # Delete the contents temporary directory
             shutil.rmtree(contents_tmpdirname)
     finally:
-        # Delete the main temporary directory
         shutil.rmtree(tmpdirname)
 
+    print(f"Finished processing of: {file_path}")
     return texts
 
-# Text processing functions
-
-def process_text(html_content):
-    # Step 1: Strip HTML tags
-    text = strip_html(html_content)
-    # Step 2: Remove page numbers and references
-    text = remove_page_numbers_and_references(text)
-    # Step 3: Remove remaining HTML artifacts
-    text = remove_html_artifacts(text)
-    # Step 4: Normalize whitespace and remove non-printable characters
-    text = normalize_whitespace(text)
-    # Step 6: Split into sentences
-    sentences = split_into_sentences(text)
-    # Step 7: Remove repeated phrases within sentences
-    sentences = [remove_repeated_phrases_in_sentence(s) for s in sentences]
-    # Step 8: Remove duplicate sentences using hashing
-    unique_sentences = remove_duplicate_sentences_hash(sentences)
-    # Step 9: Compile cleaned text
-    cleaned_text = compile_text(unique_sentences)
-    return cleaned_text
-
-def strip_html(html_content):
-    # Use lxml parser for better handling of malformed HTML
-    soup = BeautifulSoup(html_content, 'lxml')
-    text = soup.get_text()
-    return text
-
-def remove_page_numbers_and_references(text):
-    # Remove patterns like 'Página N' or 'Page N'
-    text = re.sub(r'\b(Página|Page)\s+\d+\b', '', text)
-    # Remove page numbers in text like 'p3' or 'id="p3"'
-    text = re.sub(r'\b(p|id="p)\d+"?\b', '', text)
-    # Remove references like '(Hebreos 3:4)'
-    text = re.sub(r'\([^)]*\d+:\d+[^)]*\)', '', text)
-    return text
-
-def remove_html_artifacts(text):
-    # Remove HTML attribute patterns
-    pattern = r'\b(?:class|id|data-pid|data-bid|data-no|data-before-text|style|width|height|aria-hidden|href|data-xtid|data-bid|data-no|data-before-text)\s*=\s*"[^"]*"'
-    text = re.sub(pattern, '', text)
-    # Remove any remaining '<' or '>' characters
-    text = text.replace('<', '').replace('>', '')
-    # Remove escaped quotes
-    text = text.replace('\\"', '')
-    # Remove remaining HTML entities
-    text = re.sub(r'&[^;\s]+;', '', text)
-    return text
-
-def remove_repeated_phrases(text):
-    # Remove repeated phrases within the text
-    text = re.sub(r'\b(\w+)( \1\b)+', r'\1', text, flags=re.I)
-    return text
-
-def remove_repeated_phrases_in_sentence(sentence):
-    words = sentence.split()
-    seen = set()
-    result = []
-    for word in words:
-        # Only add the word if it's not already in seen
-        if word not in seen:
-            seen.add(word)
-            result.append(word)
-    return ' '.join(result)
-
-def remove_duplicate_sentences_hash(sentences):
-    seen_hashes = set()
-    unique_sentences = []
-    for sentence in sentences:
-        # Normalize sentence for hashing
-        normalized_sentence = ''.join(e for e in sentence.lower() if e.isalnum())
-        sentence_hash = hashlib.md5(normalized_sentence.encode()).hexdigest()
-        if sentence_hash not in seen_hashes:
-            seen_hashes.add(sentence_hash)
-            unique_sentences.append(sentence)
-    return unique_sentences
-
-def normalize_whitespace(text):
-    # Replace multiple spaces with a single space
-    text = re.sub(r'\s+', ' ', text)
-    # Remove any non-printable characters
-    #text = re.sub(r'[^\x20-\x7E]', '', text)
-    text = text.strip()
-    return text
-
-def split_into_sentences(text):
-    sentences = sent_tokenize(text)
-    return sentences
-
-from difflib import SequenceMatcher
-
-def remove_similar_sentences(sentences, threshold=0.9):
-    unique_sentences = []
-    for sentence in sentences:
-        is_duplicate = False
-        for unique_sentence in unique_sentences:
-            # Normalize sentences for comparison
-            s1 = sentence.strip().lower()
-            s2 = unique_sentence.strip().lower()
-            # Skip very short sentences
-            if len(s1) < 20 or len(s2) < 20:
-                continue
-            similarity = SequenceMatcher(None, s1, s2).ratio()
-            if similarity > threshold:
-                is_duplicate = True
-                break
-        if not is_duplicate:
-            unique_sentences.append(sentence)
-    return unique_sentences
-
-def compile_text(sentences):
-    text = ' '.join(sentences)
-    return text
-
-# Main function to process all .jwpub files
-def process_all_jwpubs(directory):
-    all_texts = []
-
-    # Find all .jwpub files in the directory
-    jwpub_files = [os.path.join(directory, file) for file in os.listdir(directory) if file.endswith('.jwpub')]
-
-    for file in jwpub_files:
-        print(f"\nProcessing {file}...")
-        texts = process_jwpub(file)
-        if texts:
-            all_texts.extend(texts)
-            print(f"Extracted text from {file}")
-        else:
-            print(f"No texts extracted from {file}")
-
-    return all_texts
-
-# Function to save the extracted texts to a file
 def save_texts_to_file(texts, file_path):
+    # Use double quotes in the JSON output (standard JSON format)
     with open(file_path, 'w', encoding='utf-8') as f:
         json.dump(texts, f, ensure_ascii=False, indent=4)
 
 if __name__ == '__main__':
     # Directory and file paths
-    directory = "D:/jworg"  # Update this path to your .jwpub files directory
-    output_file_path = "D:/jworg/jwpubs.json"
-    
-    # Process all .jwpub files and extract texts
-    all_texts = process_all_jwpubs(directory)
-    
-    if all_texts:
-        # Save the extracted texts to a file
-        save_texts_to_file(all_texts, output_file_path)
-        print(f"\nExtracted texts saved to {output_file_path}")
+    directory = "E:/jworg"  # Update this path to your .jwpub files directory
+    output_file_path = "E:/jworg/jwpubs.json"
+
+    if not os.path.exists(directory):
+        print(f"The directory {directory} does not exist. Please check the path.")
     else:
-        print("\nNo texts were extracted from the .jwpub files.")
+        all_texts = []
+        # Iterate over all .jwpub files in the directory
+        for filename in os.listdir(directory):
+            if filename.endswith('.jwpub'):
+                jwpub_file = os.path.join(directory, filename)
+                # Process the .jwpub file and extract texts
+                texts = process_jwpub(jwpub_file)
+                if texts:
+                    all_texts.extend(texts)
+                else:
+                    print(f"No texts were extracted from {jwpub_file}.")
+        if all_texts:
+            save_texts_to_file(all_texts, output_file_path)
+            print(f"Extracted texts saved to {output_file_path}")
+        else:
+            print("No texts were extracted from any .jwpub files.")
